@@ -192,7 +192,7 @@ class ConstraintSolver:
         self._max_iter = max_iter
         self._inv_masses = 1.0 / np.array(masses, dtype=np.float64)
 
-    def apply_shake(self, x):
+    def apply_shake(self, x_updated, x_init=None):
         """Apply SHAKE position constraint correction.
 
         Iteratively adjusts positions so that all bond distance constraints
@@ -211,14 +211,16 @@ class ConstraintSolver:
             The corrected position array (new array).
         """
         if len(self.constraint_groups) == 0:
-            return x.copy()
-        x_ref = x.copy()
+            return x_updated.copy()
+        if x_init is None:
+            x_init = x_updated.copy()
+        x = x_updated.copy()
         for group, dists in zip(self.constraint_groups, self.constraint_distances):
             anchor = group[0]
             for i in range(self._max_iter):
                 converged = True
                 for atom, target_dist in zip(group[1:], dists):
-                    delta_ref = x_ref[anchor] - x_ref[atom]
+                    delta_ref = x_init[anchor] - x_init[atom]
                     target_dist_2 = target_dist**2
                     delta = x[anchor] - x[atom]
                     dist2 = np.dot(delta, delta)
@@ -291,8 +293,8 @@ class ConstraintSolver:
     def apply_velocity_constraints(self, x, v):
         return self.apply_rattle(x, v)
 
-    def apply_positional_constraints(self, x):
-        return self.apply_shake(x)
+    def apply_positional_constraints(self, x_updated, x_init=None):
+        return self.apply_shake(x_updated, x_init)
 
     def solve(self, x, v):
         """Apply SHAKE to positions then RATTLE to velocities.
@@ -361,7 +363,7 @@ class ConstrainedLangevinIntegrator(LangevinIntegrator):
         v_mid = self._solver.apply_velocity_constraints(x, v_mid)
         new_v = (self.ca * v_mid) + (self.cc * noise)
         preconstrained = x + 0.5 * self.dt * (v_mid + new_v)
-        new_x = self._solver.apply_positional_constraints(preconstrained)
+        new_x = self._solver.apply_positional_constraints(preconstrained, x_init=x)
         # Adjust the velocities by the change in the positions
         # Ref: https://github.com/choderalab/integrator-benchmark/blob/bb307e6ebf476b652e62e41ae49730f530732da3/benchmark/integrators/langevin.py#L130-L133
         new_v += (new_x - preconstrained) / self.dt
