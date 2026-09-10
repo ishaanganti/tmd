@@ -2609,12 +2609,6 @@ def run_sims_hrex(
                     print(f"Early stop at frame {n_done}/{md_params.n_frames} ({frames_saved} frames saved)")
                     break
             else:
-                if early_stop_consecutive_passes > 0:
-                    print(
-                        f"Early-stop check @ frame {n_done}: not converged "
-                        f"(|dG diff| = {dg_diff_kcal:.3f}, errs = ({err_a_kcal:.3f}, {err_b_kcal:.3f})) — "
-                        f"resetting pass streak"
-                    )
                 early_stop_consecutive_passes = 0
 
     n_frames_completed = converged_at_frame if converged_at_frame is not None else md_params.n_frames
