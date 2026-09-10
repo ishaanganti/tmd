@@ -32,6 +32,7 @@ from tmd.fe.bar import (
     bar_with_pessimistic_uncertainty,
     construct_mbar_from_u_kln,
     df_and_err_from_mbar,
+    df_from_ukln_by_lambda,
     pair_overlap_from_mbar,
     sanitize_energies_for_bar,
     works_from_ukln,
@@ -203,12 +204,23 @@ class MDParams:
     water_sampling_params: WaterSamplingParams | None = None
     dt: float = 2.5e-3
 
+    # Setting early_stop_tol to None disables HREX early stopping. Tolerance is in kcal/mol.
+    early_stop_tol: float | None = None
+    early_stop_check_interval: int = 100
+    # Setting early_stop_min_frames to None defaults to max(2, n_frames // 4) at runtime.
+    early_stop_min_frames: int | None = None
+
     def __post_init__(self):
         assert self.steps_per_frame > 0
         assert self.n_frames > 0
         assert self.n_eq_steps >= 0
         if self.local_md_params is not None:
             assert self.local_md_params.local_steps <= self.steps_per_frame
+        if self.early_stop_tol is not None:
+            assert self.early_stop_tol > 0
+            assert self.early_stop_check_interval > 0
+            if self.early_stop_min_frames is not None:
+                assert 0 < self.early_stop_min_frames <= self.n_frames
 
 
 @dataclass
@@ -477,7 +489,14 @@ def compute_total_ns(res: SimulationResult | HREXSimulationResult, md_params: MD
     steps_per_production_frame = md_params.steps_per_frame
     if md_params.hrex_params is not None:
         steps_per_production_frame *= md_params.hrex_params.iterations_per_frame
-    total_steps += steps_per_production_frame * md_params.n_frames * n_windows
+    # Prefer the actual frames completed when early stop truncated the run.
+    n_production_frames = md_params.n_frames
+    hrex_diag = getattr(res, "hrex_diagnostics", None)
+    if hrex_diag is not None:
+        recorded = getattr(hrex_diag, "n_frames_completed", None)
+        if recorded is not None:
+            n_production_frames = recorded
+    total_steps += steps_per_production_frame * n_production_frames * n_windows
 
     dt = res.final_result.initial_states[0].integrator.dt
     dt_in_fs = 1000 * dt
@@ -2447,6 +2466,18 @@ def run_sims_hrex(
 
     inv_kbt = 1 / kBT
 
+    # Split-half convergence check; requires two consecutive passes to guard against noisy crossings.
+    KJ_PER_KCAL = 4.184
+    early_stop_enabled = md_params.early_stop_tol is not None
+    if early_stop_enabled:
+        early_stop_min_frames = md_params.early_stop_min_frames or max(2, md_params.n_frames // 4)
+        early_stop_check_every = md_params.early_stop_check_interval
+        early_stop_tol_kcal = md_params.early_stop_tol
+        early_stop_to_kcal = kBT / KJ_PER_KCAL
+        early_stop_passes_required = 2
+        early_stop_consecutive_passes = 0
+    converged_at_frame: int | None = None
+
     for current_frame in range(md_params.n_frames):
         for i in range(iters_per_frame):
             hrex, samples_by_state_iter, U_kl_raw, water_sampler_proposals_by_state = hrex_func(
@@ -2533,6 +2564,53 @@ def run_sims_hrex(
 
             last_update_time = current_time
 
+        if early_stop_enabled and (current_frame + 1) >= early_stop_min_frames \
+                and (current_frame + 1) % early_stop_check_every == 0:
+            n_done = current_frame + 1
+            n_iters_done = n_done * iters_per_frame
+            half = n_iters_done // 2
+            # Sum across potential components to match the downstream BAR call.
+            ukln_so_far = iterated_u_kln.sum(0)[..., :n_iters_done]
+            df_a, err_a = df_from_ukln_by_lambda(ukln_so_far[..., :half])
+            df_b, err_b = df_from_ukln_by_lambda(ukln_so_far[..., half:])
+            dg_diff_kcal = abs(df_a - df_b) * early_stop_to_kcal
+            err_a_kcal = err_a * early_stop_to_kcal
+            err_b_kcal = err_b * early_stop_to_kcal
+            passed = (
+                dg_diff_kcal < early_stop_tol_kcal
+                and err_a_kcal < early_stop_tol_kcal
+                and err_b_kcal < early_stop_tol_kcal
+            )
+            if passed:
+                early_stop_consecutive_passes += 1
+                print(
+                    f"Early-stop check @ frame {n_done}: "
+                    f"|dG(first half) - dG(second half)| = {dg_diff_kcal:.3f} kcal/mol, "
+                    f"errs = ({err_a_kcal:.3f}, {err_b_kcal:.3f}) — "
+                    f"pass {early_stop_consecutive_passes}/{early_stop_passes_required}"
+                )
+                if early_stop_consecutive_passes >= early_stop_passes_required:
+                    converged_at_frame = n_done
+                    frames_saved = md_params.n_frames - n_done
+                    print(
+                        f"Early stop at frame {n_done}/{md_params.n_frames} "
+                        f"({frames_saved} frames saved)"
+                    )
+                    break
+            else:
+                if early_stop_consecutive_passes > 0:
+                    print(
+                        f"Early-stop check @ frame {n_done}: not converged "
+                        f"(|dG diff| = {dg_diff_kcal:.3f}, errs = ({err_a_kcal:.3f}, {err_b_kcal:.3f})) — "
+                        f"resetting pass streak"
+                    )
+                early_stop_consecutive_passes = 0
+
+    # Truncate off unfilled (np.inf) tail when early stop fired; no-op otherwise.
+    n_frames_completed = converged_at_frame if converged_at_frame is not None else md_params.n_frames
+    n_iters_completed = n_frames_completed * iters_per_frame
+    iterated_u_kln = iterated_u_kln[..., :n_iters_completed]
+
     neighbor_ulkns_by_component = [iterated_u_kln[:, i : i + 2, i : i + 2, :] for i in range(len(initial_states) - 1)]
 
     pair_bar_results = [
@@ -2540,7 +2618,11 @@ def run_sims_hrex(
         for u_kln_by_component in neighbor_ulkns_by_component
     ]
 
-    hrex_diagnostics = HREXDiagnostics(replica_idx_by_state_by_iter, fraction_accepted_by_pair_by_iter)
+    hrex_diagnostics = HREXDiagnostics(
+        replica_idx_by_state_by_iter,
+        fraction_accepted_by_pair_by_iter,
+        n_frames_completed=n_frames_completed,
+    )
     ws_diagnostics: WaterSamplingDiagnostics | None = None
     if md_params.water_sampling_params is not None:
         ws_diagnostics = WaterSamplingDiagnostics(np.array(water_sampler_proposals_by_state_by_iter, dtype=np.int32))
