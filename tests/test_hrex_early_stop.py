@@ -1,17 +1,18 @@
-"""Unit tests for HREX early-stop plumbing.
+"""Unit tests for HREX early-stop plumbing, plus an end-to-end convergence test."""
 
-End-to-end triggering of early stop is left to integration tests (existing HREX tests with
-early_stop_tol set).
-"""
-
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pytest
 
+from tmd.constants import DEFAULT_TEMP
 from tmd.fe.bar import df_from_ukln_by_lambda
-from tmd.fe.free_energy import HREXParams, MDParams, compute_total_ns
+from tmd.fe.free_energy import HREXParams, MDParams, compute_total_ns, run_sims_hrex
+from tmd.fe.rbfe import DEFAULT_HREX_PARAMS, setup_initial_states
+from tmd.fe.single_topology import SingleTopology
+from tmd.ff import Forcefield
 from tmd.md.hrex import HREXDiagnostics
+from tmd.testsystems.relative import get_hif2a_ligand_pair_single_topology
 
 
 def _md_params(**overrides):
@@ -103,3 +104,45 @@ def test_split_half_bar_distinguishes_converged_from_drifting():
     df_a, _ = df_from_ukln_by_lambda(drifting[..., :half])
     df_b, _ = df_from_ukln_by_lambda(drifting[..., half:])
     assert abs(df_a - df_b) > 1.0
+
+
+def test_run_sims_hrex_early_stop_converges_to_same_answer():
+    """End-to-end: early stopping should fire on a real HREX run, and the truncated dG should
+    agree with a full-length reference run (i.e. stopping early doesn't change the answer)."""
+    lambdas = np.linspace(0.0, 0.1, 4)  # close windows -> high overlap, fast convergence
+    forcefield = Forcefield.load_default()
+    mol_a, mol_b, core = get_hif2a_ligand_pair_single_topology()
+    single_topology = SingleTopology(mol_a, mol_b, core, forcefield)
+
+    initial_states = setup_initial_states(
+        single_topology,
+        None,  # vacuum
+        DEFAULT_TEMP,
+        lambdas,
+        seed=2026,
+        verify_constraints=False,
+        min_cutoff=None,
+    )
+
+    base_params = replace(DEFAULT_HREX_PARAMS, n_frames=500, n_eq_steps=1000, steps_per_frame=100)
+
+    reference_result, _, reference_diagnostics, _ = run_sims_hrex(initial_states, base_params)
+    assert reference_diagnostics.n_frames_completed == base_params.n_frames
+
+    early_stop_params = replace(
+        base_params,
+        early_stop_tol=0.5,
+        early_stop_check_interval=10,
+        early_stop_min_frames=20,
+    )
+    early_stop_result, _, early_stop_diagnostics, _ = run_sims_hrex(initial_states, early_stop_params)
+
+    # Early stop must actually fire well before the full run, i.e. the feature does something.
+    assert early_stop_diagnostics.n_frames_completed is not None
+    assert early_stop_diagnostics.n_frames_completed < base_params.n_frames
+
+    # And the truncated estimate must still agree with the fully-converged reference estimate.
+    total_dG_reference = sum(reference_result.dGs)
+    total_dG_early_stop = sum(early_stop_result.dGs)
+    combined_err = np.linalg.norm(reference_result.dG_errs) + np.linalg.norm(early_stop_result.dG_errs)
+    assert abs(total_dG_reference - total_dG_early_stop) < max(5 * combined_err, 1.0)

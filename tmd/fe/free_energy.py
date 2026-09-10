@@ -2210,6 +2210,9 @@ def run_sequential_hrex_step(
             # Run equilibration as part of the first frame
             n_eq_steps=md_params.n_eq_steps if current_frame == 0 else 0,
             seed=state_idx + current_frame,
+            # Early stop is checked in the outer loop, not per single-frame sample.
+            early_stop_tol=None,
+            early_stop_min_frames=None,
         )
 
         assert md_params_replica.n_frames == 1
@@ -2297,6 +2300,9 @@ def run_batched_hrex_step(
         # Run equilibration as part of the first frame
         n_eq_steps=md_params.n_eq_steps if current_frame == 0 else 0,
         seed=md_params.seed + current_frame,
+        # Early stop is checked in the outer loop, not per single-frame sample.
+        early_stop_tol=None,
+        early_stop_min_frames=None,
     )
 
     assert md_params_replica.n_frames == 1
@@ -2466,7 +2472,6 @@ def run_sims_hrex(
 
     inv_kbt = 1 / kBT
 
-    # Split-half convergence check; requires two consecutive passes to guard against noisy crossings.
     KJ_PER_KCAL = 4.184
     early_stop_enabled = md_params.early_stop_tol is not None
     if early_stop_enabled:
@@ -2474,7 +2479,7 @@ def run_sims_hrex(
         early_stop_check_every = md_params.early_stop_check_interval
         early_stop_tol_kcal = md_params.early_stop_tol
         early_stop_to_kcal = kBT / KJ_PER_KCAL
-        early_stop_passes_required = 2
+        early_stop_passes_required = 2  # guards against a single noisy crossing of the tolerance
         early_stop_consecutive_passes = 0
     converged_at_frame: int | None = None
 
@@ -2564,15 +2569,22 @@ def run_sims_hrex(
 
             last_update_time = current_time
 
-        if early_stop_enabled and (current_frame + 1) >= early_stop_min_frames \
-                and (current_frame + 1) % early_stop_check_every == 0:
+        if (
+            early_stop_enabled
+            and (current_frame + 1) >= early_stop_min_frames
+            and (current_frame + 1) % early_stop_check_every == 0
+        ):
             n_done = current_frame + 1
             n_iters_done = n_done * iters_per_frame
             half = n_iters_done // 2
-            # Sum across potential components to match the downstream BAR call.
+            # df_from_ukln_by_lambda expects neighbor-pair-decomposed [n_lambda, 2, 2, n], matching
+            # neighbor_ulkns_by_component below.
             ukln_so_far = iterated_u_kln.sum(0)[..., :n_iters_done]
-            df_a, err_a = df_from_ukln_by_lambda(ukln_so_far[..., :half])
-            df_b, err_b = df_from_ukln_by_lambda(ukln_so_far[..., half:])
+            neighbor_ukln_so_far = np.stack(
+                [ukln_so_far[i : i + 2, i : i + 2, :] for i in range(len(initial_states) - 1)]
+            )
+            df_a, err_a = df_from_ukln_by_lambda(neighbor_ukln_so_far[..., :half])
+            df_b, err_b = df_from_ukln_by_lambda(neighbor_ukln_so_far[..., half:])
             dg_diff_kcal = abs(df_a - df_b) * early_stop_to_kcal
             err_a_kcal = err_a * early_stop_to_kcal
             err_b_kcal = err_b * early_stop_to_kcal
@@ -2592,10 +2604,7 @@ def run_sims_hrex(
                 if early_stop_consecutive_passes >= early_stop_passes_required:
                     converged_at_frame = n_done
                     frames_saved = md_params.n_frames - n_done
-                    print(
-                        f"Early stop at frame {n_done}/{md_params.n_frames} "
-                        f"({frames_saved} frames saved)"
-                    )
+                    print(f"Early stop at frame {n_done}/{md_params.n_frames} ({frames_saved} frames saved)")
                     break
             else:
                 if early_stop_consecutive_passes > 0:
@@ -2606,7 +2615,6 @@ def run_sims_hrex(
                     )
                 early_stop_consecutive_passes = 0
 
-    # Truncate off unfilled (np.inf) tail when early stop fired; no-op otherwise.
     n_frames_completed = converged_at_frame if converged_at_frame is not None else md_params.n_frames
     n_iters_completed = n_frames_completed * iters_per_frame
     iterated_u_kln = iterated_u_kln[..., :n_iters_completed]
