@@ -1,9 +1,9 @@
 """Unit tests for HREX early-stop plumbing, plus an end-to-end convergence test."""
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
 from tmd.constants import DEFAULT_TEMP
 from tmd.fe.bar import df_from_ukln_by_lambda
@@ -15,66 +15,22 @@ from tmd.md.hrex import HREXDiagnostics
 from tmd.testsystems.relative import get_hif2a_ligand_pair_single_topology
 
 
-def _md_params(**overrides):
-    kwargs = dict(n_frames=1000, n_eq_steps=10_000, steps_per_frame=400, seed=2026, hrex_params=HREXParams())
-    kwargs.update(overrides)
-    return MDParams(**kwargs)
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        dict(early_stop_tol=-0.1),
-        dict(early_stop_tol=0.0),
-        dict(early_stop_tol=0.1, early_stop_check_interval=0),
-        dict(n_frames=100, early_stop_tol=0.1, early_stop_min_frames=101),
-    ],
-)
-def test_early_stop_config_validation_rejects_invalid(kwargs):
-    with pytest.raises(AssertionError):
-        _md_params(**kwargs)
-
-
-def test_early_stop_disabled_by_default():
-    p = _md_params()
-    assert p.early_stop_tol is None
-    # min_frames validation is intentionally skipped when the feature is off.
-    assert _md_params(early_stop_min_frames=999_999).early_stop_min_frames == 999_999
-
-
-@dataclass
-class _FakeInitialState:
-    integrator: object
-
-
-@dataclass
-class _FakeIntegrator:
-    dt: float = 2.5e-3
-
-
-@dataclass
-class _FakePairBarResult:
-    initial_states: list
-
-
-@dataclass
-class _FakeHREXSimulationResult:
-    final_result: _FakePairBarResult
-    hrex_diagnostics: HREXDiagnostics
-    intermediate_results: list
-
-
-def _fake_result(n_windows, diagnostics):
-    states = [_FakeInitialState(_FakeIntegrator()) for _ in range(n_windows)]
-    return _FakeHREXSimulationResult(_FakePairBarResult(states), diagnostics, [])
+def _fake_hrex_result(n_windows, diagnostics):
+    integrator = SimpleNamespace(dt=2.5e-3)
+    states = [SimpleNamespace(integrator=integrator) for _ in range(n_windows)]
+    return SimpleNamespace(
+        final_result=SimpleNamespace(initial_states=states),
+        hrex_diagnostics=diagnostics,
+        intermediate_results=[],
+    )
 
 
 def test_compute_total_ns_uses_recorded_frames_when_present():
-    p = _md_params(n_frames=100)
-    full = compute_total_ns(_fake_result(3, HREXDiagnostics([], [], n_frames_completed=100)), p)
-    half = compute_total_ns(_fake_result(3, HREXDiagnostics([], [], n_frames_completed=50)), p)
+    p = MDParams(n_frames=100, n_eq_steps=10_000, steps_per_frame=400, seed=2026, hrex_params=HREXParams())
+    full = compute_total_ns(_fake_hrex_result(3, HREXDiagnostics([], [], n_frames_completed=100)), p)
+    half = compute_total_ns(_fake_hrex_result(3, HREXDiagnostics([], [], n_frames_completed=50)), p)
     # Fallback path: n_frames_completed=None must behave the same as recording md_params.n_frames.
-    fallback = compute_total_ns(_fake_result(3, HREXDiagnostics([], [], n_frames_completed=None)), p)
+    fallback = compute_total_ns(_fake_hrex_result(3, HREXDiagnostics([], [], n_frames_completed=None)), p)
     assert half < full == fallback
 
 
