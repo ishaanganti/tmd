@@ -374,7 +374,6 @@ def get_samples_by_iter_by_replica(
 class HREXDiagnostics:
     replica_idx_by_state_by_iter: list[list[ReplicaIdx]]
     fraction_accepted_by_pair_by_iter: list[list[tuple[int, int]]]
-    # None when not recorded (older pickled diagnostics); fall back to md_params.n_frames.
     n_frames_completed: int | None = None
 
     @property

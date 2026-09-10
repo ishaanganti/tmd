@@ -2210,7 +2210,8 @@ def run_sequential_hrex_step(
             # Run equilibration as part of the first frame
             n_eq_steps=md_params.n_eq_steps if current_frame == 0 else 0,
             seed=state_idx + current_frame,
-            # Early stop is checked in the outer loop, not per single-frame sample.
+            # Clear early-stop config to avoid tripping the min_frames <= n_frames assertion,
+            # since n_frames is 1 here. Early stop is only checked in the outer run_sims_hrex loop.
             early_stop_tol=None,
             early_stop_min_frames=None,
         )
@@ -2300,7 +2301,8 @@ def run_batched_hrex_step(
         # Run equilibration as part of the first frame
         n_eq_steps=md_params.n_eq_steps if current_frame == 0 else 0,
         seed=md_params.seed + current_frame,
-        # Early stop is checked in the outer loop, not per single-frame sample.
+        # Clear early-stop config to avoid tripping the min_frames <= n_frames assertion,
+        # since n_frames is 1 here. Early stop is only checked in the outer run_sims_hrex loop.
         early_stop_tol=None,
         early_stop_min_frames=None,
     )
